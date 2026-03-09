@@ -37,6 +37,7 @@ test_room
 *.err
 viz_*
 logs/
+exp/
 evaluation/
 output_objects/
 pretrained/
