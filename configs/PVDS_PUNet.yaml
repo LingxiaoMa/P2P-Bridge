@@ -17,6 +17,19 @@ diffusion:
   t0: 1.e-4
   T: 1.0
   ot_ode: true
+  straightness:
+    enabled: false
+    train:
+      use_vm_head: true
+      vm_hidden_dim: 64
+      lambda_vm_mse: 0.25
+      lambda_vm_cos: 0.05
+      lambda_line: 0.10
+      warmup_steps: 10000
+    sample:
+      enabled: false
+      guidance_gamma: 0.30
+      use_vm_direction: true
 model:
   type: PVD
   ema: true

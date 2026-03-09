@@ -3,6 +3,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from ema_pytorch import EMA
 from loguru import logger
 from torch import Tensor
@@ -85,10 +87,31 @@ class P2PB(DiffusionModel):
         self.symmetric = cfg.diffusion.symmetric if "symmetric" in cfg.diffusion else True
         self.loss_multiplier = cfg.diffusion.loss_multiplier if "loss_multiplier" in cfg.diffusion else 1.0
         snr_clip = cfg.diffusion.snr_clip if "snr_clip" in cfg.diffusion else False
+        straight_cfg = cfg.diffusion.get("straightness", {})
+        straight_train_cfg = straight_cfg.get("train", {})
+        straight_sample_cfg = straight_cfg.get("sample", {})
+
+        self.straightness_enabled = bool(straight_cfg.get("enabled", False))
+        self.straight_vm_enabled = bool(straight_train_cfg.get("use_vm_head", True))
+        self.straight_lambda_vm_mse = float(straight_train_cfg.get("lambda_vm_mse", 0.0))
+        self.straight_lambda_vm_cos = float(straight_train_cfg.get("lambda_vm_cos", 0.0))
+        self.straight_lambda_line = float(straight_train_cfg.get("lambda_line", 0.0))
+        self.straight_warmup_steps = int(straight_train_cfg.get("warmup_steps", 0))
+        self.straight_sample_enabled = bool(straight_sample_cfg.get("enabled", False))
+        self.straight_sample_gamma = float(straight_sample_cfg.get("guidance_gamma", 0.0))
+        self.straight_use_vm_direction = bool(straight_sample_cfg.get("use_vm_direction", True))
 
         # load model
         self.model = model.to(device)
         self.ema = EMA(self.model, beta=0.999) if cfg.model.ema else None
+        self.vm_head = None
+        if self.straightness_enabled and self.straight_vm_enabled:
+            vm_hidden_dim = int(straight_train_cfg.get("vm_hidden_dim", 64))
+            self.vm_head = nn.Sequential(
+                nn.LazyConv1d(vm_hidden_dim, kernel_size=1),
+                nn.SiLU(),
+                nn.Conv1d(vm_hidden_dim, 3, kernel_size=1),
+            ).to(device)
 
         # create betas
         betas = make_beta_schedule(
@@ -147,6 +170,9 @@ class P2PB(DiffusionModel):
         # in x0 prediction the loss weight is set to the backward std
         elif self.objective == "pred_x0":
             register_buffer("loss_weight", maybe_clipped_snr)
+
+        self.register_buffer("_straight_train_step", torch.zeros((), dtype=torch.long), persistent=False)
+        self.latest_straightness_terms = {}
 
     def get_std_fwd(self, step: int, xdim: Tuple[int, ...] = None):
         std_fwd = self.std_fwd[step]
@@ -212,6 +238,87 @@ class P2PB(DiffusionModel):
 
         return xt_prev
 
+    def _straightness_warmup_scale(self) -> float:
+        if not self.straightness_enabled:
+            return 0.0
+        if self.straight_warmup_steps <= 0:
+            return 1.0
+        current_step = int(self._straight_train_step.item())
+        return min(1.0, current_step / float(self.straight_warmup_steps))
+
+    def _predict_vm_direction(self, latent_features: Optional[Tensor]) -> Optional[Tensor]:
+        if self.vm_head is None or latent_features is None:
+            return None
+        return self.vm_head(latent_features)
+
+    @staticmethod
+    def _collinearity_loss(direction: Tensor, target_direction: Tensor) -> Tensor:
+        direction = direction.transpose(1, 2)
+        target_direction = F.normalize(target_direction.transpose(1, 2), dim=-1, eps=1e-8)
+
+        proj = torch.sum(direction * target_direction, dim=-1, keepdim=True) * target_direction
+        perp = direction - proj
+
+        perp_norm_sq = torch.sum(perp**2, dim=-1)
+        direction_norm_sq = torch.sum(direction**2, dim=-1)
+        return (perp_norm_sq / (direction_norm_sq + 1e-8)).mean()
+
+    def _compute_straightness_losses(
+        self,
+        steps: Tensor,
+        xt: Tensor,
+        pred: Tensor,
+        x0: Tensor,
+        x1: Tensor,
+        vm_direction: Optional[Tensor],
+    ) -> Tensor:
+        target_direction = (x0 - x1).detach()
+        if self.objective == "pred_noise":
+            pred_x0 = self.compute_pred_x0_from_eps(steps, xt, pred, clip_denoise=False)
+        else:
+            pred_x0 = pred
+
+        denoise_direction = pred_x0 - xt
+
+        straight_loss = torch.tensor(0.0, device=xt.device)
+        loss_terms = {}
+
+        if vm_direction is not None and self.straight_lambda_vm_mse > 0:
+            vm_mse = F.mse_loss(vm_direction, target_direction)
+            straight_loss = straight_loss + self.straight_lambda_vm_mse * vm_mse
+            loss_terms["vm_mse"] = vm_mse.detach()
+
+        if vm_direction is not None and self.straight_lambda_vm_cos > 0:
+            vm_cos = F.cosine_similarity(
+                vm_direction.transpose(1, 2),
+                target_direction.transpose(1, 2),
+                dim=-1,
+                eps=1e-8,
+            )
+            vm_cos_loss = (1.0 - vm_cos).mean()
+            straight_loss = straight_loss + self.straight_lambda_vm_cos * vm_cos_loss
+            loss_terms["vm_cos"] = vm_cos_loss.detach()
+
+        if self.straight_lambda_line > 0:
+            line_loss = self._collinearity_loss(denoise_direction, target_direction)
+            straight_loss = straight_loss + self.straight_lambda_line * line_loss
+            loss_terms["line"] = line_loss.detach()
+
+        self.latest_straightness_terms = {k: v.item() for k, v in loss_terms.items()}
+        return straight_loss
+
+    def _apply_straightness_guidance(self, xt: Tensor, xt_prev: Tensor, line_direction: Tensor) -> Tensor:
+        gamma = float(np.clip(self.straight_sample_gamma, 0.0, 1.0))
+        if gamma <= 0:
+            return xt_prev
+
+        displacement = (xt_prev - xt).transpose(1, 2)
+        line_direction = F.normalize(line_direction.transpose(1, 2), dim=-1, eps=1e-8)
+
+        displacement_proj = torch.sum(displacement * line_direction, dim=-1, keepdim=True) * line_direction
+        displacement_guided = (1.0 - gamma) * displacement + gamma * displacement_proj
+        return xt + displacement_guided.transpose(1, 2)
+
     def sample_ddpm(
         self,
         steps: List[int],
@@ -251,8 +358,16 @@ class P2PB(DiffusionModel):
         pair_steps = tqdm(pair_steps, desc="DDPM sampling", total=len(steps) - 1) if verbose else pair_steps
         for prev_step, step in pair_steps:
             assert prev_step < step, f"{prev_step=}, {step=}"
-            pred_x0 = pred_x0_fn(xt, step, x1=x1, x_cond=x_cond)
-            xt = self.p_posterior(prev_step, step, xt, pred_x0)
+            pred_x0, vm_direction = pred_x0_fn(xt, step, x1=x1, x_cond=x_cond)
+            xt_prev = self.p_posterior(prev_step, step, xt, pred_x0)
+
+            if self.straight_sample_enabled and self.straight_sample_gamma > 0:
+                line_direction = vm_direction if (vm_direction is not None and self.straight_use_vm_direction) else (
+                    pred_x0 - x1
+                )
+                xt_prev = self._apply_straightness_guidance(xt, xt_prev, line_direction)
+
+            xt = xt_prev
 
             if prev_step in log_steps:
                 pred_x0s.append(pred_x0.detach())
@@ -304,19 +419,36 @@ class P2PB(DiffusionModel):
         def pred_x0_fn(xt, step, x1, x_cond=None):
             step = torch.full((xt.shape[0],), step, device=self.device, dtype=torch.long)
             noise_levels = self.noise_levels[step].detach()
+            use_vm_direction = (
+                self.straight_sample_enabled
+                and self.straight_use_vm_direction
+                and self.vm_head is not None
+                and not (use_ema and self.ema is not None)
+            )
+            need_latent = use_vm_direction
 
             if self.cond_x1:
-                x_cond = torch.cat([x1, x_cond], dim=1)
+                if x_cond is not None:
+                    x_cond = torch.cat([x1, x_cond], dim=1)
+                else:
+                    x_cond = x1
 
             if use_ema and self.ema is not None:
-                out = self.ema(xt, noise_levels, x_cond=x_cond)
+                out = self.ema(xt, noise_levels, x_cond=x_cond, return_latent=need_latent)
             else:
-                out = self.model(xt, noise_levels, x_cond=x_cond)
+                out = self.model(xt, noise_levels, x_cond=x_cond, return_latent=need_latent)
+
+            vm_direction = None
+            if need_latent:
+                out, latent_features = out
+                vm_direction = self._predict_vm_direction(latent_features)
 
             if self.objective == "pred_noise":
-                return self.compute_pred_x0_from_eps(step, xt, out, clip_denoise=clip_denoise)
+                pred_x0 = self.compute_pred_x0_from_eps(step, xt, out, clip_denoise=clip_denoise)
             elif self.objective == "pred_x0":
-                return out
+                pred_x0 = out
+
+            return pred_x0, vm_direction
 
         xs, pred_x0 = self.sample_ddpm(
             steps,
@@ -401,13 +533,27 @@ class P2PB(DiffusionModel):
                 x_cond = x1
 
         noise_levels = self.noise_levels[steps].detach()
+        need_latent = self.straightness_enabled and self.vm_head is not None
+        model_out = self.model(xt, noise_levels, x_cond=x_cond, return_latent=need_latent)
 
-        pred = self.model(xt, noise_levels, x_cond=x_cond)
+        latent_features = None
+        if need_latent:
+            pred, latent_features = model_out
+        else:
+            pred = model_out
 
         loss = self.calculate_loss(pred, gt)
         if self.weight_loss:
             loss = loss * extract(self.loss_weight, steps, loss.shape)
         loss = loss.mean()
         loss = loss * self.loss_multiplier
+
+        if self.training and self.straightness_enabled:
+            self._straight_train_step += 1
+            warmup_scale = self._straightness_warmup_scale()
+            if warmup_scale > 0:
+                vm_direction = self._predict_vm_direction(latent_features)
+                straight_loss = self._compute_straightness_losses(steps, xt, pred, x0, x1, vm_direction)
+                loss = loss + warmup_scale * straight_loss
 
         return loss
