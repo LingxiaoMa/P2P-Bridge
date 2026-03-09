@@ -22,13 +22,14 @@ diffusion:
     train:
       use_vm_head: true
       vm_hidden_dim: 64
-      lambda_vm_mse: 0.25
-      lambda_vm_cos: 0.05
-      lambda_line: 0.10
-      warmup_steps: 10000
+      lambda_vm_mse: 0.05
+      lambda_vm_cos: 0.01
+      lambda_line: 0.00
+      warmup_steps: 40000
+      min_t_ratio: 0.60
     sample:
       enabled: false
-      guidance_gamma: 0.30
+      guidance_gamma: 0.00
       use_vm_direction: true
 model:
   type: PVD

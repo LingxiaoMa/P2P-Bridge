@@ -97,6 +97,7 @@ class P2PB(DiffusionModel):
         self.straight_lambda_vm_cos = float(straight_train_cfg.get("lambda_vm_cos", 0.0))
         self.straight_lambda_line = float(straight_train_cfg.get("lambda_line", 0.0))
         self.straight_warmup_steps = int(straight_train_cfg.get("warmup_steps", 0))
+        self.straight_min_t_ratio = float(np.clip(straight_train_cfg.get("min_t_ratio", 0.6), 0.0, 1.0))
         self.straight_sample_enabled = bool(straight_sample_cfg.get("enabled", False))
         self.straight_sample_gamma = float(straight_sample_cfg.get("guidance_gamma", 0.0))
         self.straight_use_vm_direction = bool(straight_sample_cfg.get("use_vm_direction", True))
@@ -261,7 +262,7 @@ class P2PB(DiffusionModel):
 
         perp_norm_sq = torch.sum(perp**2, dim=-1)
         direction_norm_sq = torch.sum(direction**2, dim=-1)
-        return (perp_norm_sq / (direction_norm_sq + 1e-8)).mean()
+        return (perp_norm_sq / (direction_norm_sq + 1e-8)).mean(dim=1)
 
     def _compute_straightness_losses(
         self,
@@ -273,6 +274,15 @@ class P2PB(DiffusionModel):
         vm_direction: Optional[Tensor],
     ) -> Tensor:
         target_direction = (x0 - x1).detach()
+        step_ratio = steps.float() / float(max(self.timesteps - 1, 1))
+        active_mask = (step_ratio >= self.straight_min_t_ratio).float()
+        active_count = active_mask.sum()
+        if active_count.item() < 1:
+            self.latest_straightness_terms = {}
+            return torch.tensor(0.0, device=xt.device)
+
+        masked_mean = lambda x: (x * active_mask).sum() / (active_count + 1e-8)
+
         if self.objective == "pred_noise":
             pred_x0 = self.compute_pred_x0_from_eps(steps, xt, pred, clip_denoise=False)
         else:
@@ -281,10 +291,11 @@ class P2PB(DiffusionModel):
         denoise_direction = pred_x0 - xt
 
         straight_loss = torch.tensor(0.0, device=xt.device)
-        loss_terms = {}
+        loss_terms = {"active_ratio": active_mask.mean().detach()}
 
         if vm_direction is not None and self.straight_lambda_vm_mse > 0:
-            vm_mse = F.mse_loss(vm_direction, target_direction)
+            vm_mse_per_sample = ((vm_direction - target_direction) ** 2).mean(dim=(1, 2))
+            vm_mse = masked_mean(vm_mse_per_sample)
             straight_loss = straight_loss + self.straight_lambda_vm_mse * vm_mse
             loss_terms["vm_mse"] = vm_mse.detach()
 
@@ -295,12 +306,14 @@ class P2PB(DiffusionModel):
                 dim=-1,
                 eps=1e-8,
             )
-            vm_cos_loss = (1.0 - vm_cos).mean()
+            vm_cos_loss_per_sample = (1.0 - vm_cos).mean(dim=-1)
+            vm_cos_loss = masked_mean(vm_cos_loss_per_sample)
             straight_loss = straight_loss + self.straight_lambda_vm_cos * vm_cos_loss
             loss_terms["vm_cos"] = vm_cos_loss.detach()
 
         if self.straight_lambda_line > 0:
-            line_loss = self._collinearity_loss(denoise_direction, target_direction)
+            line_loss_per_sample = self._collinearity_loss(denoise_direction, target_direction)
+            line_loss = masked_mean(line_loss_per_sample)
             straight_loss = straight_loss + self.straight_lambda_line * line_loss
             loss_terms["line"] = line_loss.detach()
 
