@@ -35,17 +35,6 @@ def parse_args():
     parser.add_argument("--gpu", type=str, default="cuda:0", help="GPU to use.")
     parser.add_argument("--steps", type=int, default=5, help="Number of steps for the diffusion.")
     parser.add_argument("--distribution_type", default="none")
-    parser.add_argument(
-        "--straight_sample",
-        action="store_true",
-        help="Enable straightness guidance during reverse sampling.",
-    )
-    parser.add_argument(
-        "--straight_sample_gamma",
-        type=float,
-        default=None,
-        help="Override straightness guidance gamma used during reverse sampling.",
-    )
     args = parser.parse_args()
 
     # load config from checkpoint
@@ -55,30 +44,11 @@ def parse_args():
     # merge with args
     cfg = omegaconf.OmegaConf.merge(cfg, omegaconf.OmegaConf.create(vars(args)))
 
-    if "straightness" not in cfg.diffusion:
-        cfg.diffusion.straightness = omegaconf.OmegaConf.create(
-            {
-                "enabled": False,
-                "train": {
-                    "use_vm_head": True,
-                    "vm_hidden_dim": 64,
-                    "lambda_vm_mse": 0.0,
-                    "lambda_vm_cos": 0.0,
-                    "lambda_line": 0.0,
-                    "warmup_steps": 0,
-                },
-                "sample": {
-                    "enabled": False,
-                    "guidance_gamma": 0.0,
-                    "use_vm_direction": True,
-                },
-            }
+    # ensure consistency config exists (for loading old checkpoints)
+    if "consistency" not in cfg.diffusion:
+        cfg.diffusion.consistency = omegaconf.OmegaConf.create(
+            {"enabled": False, "lambda_cons": 0.1, "warmup_steps": 5000, "use_ema_target": True}
         )
-
-    if args.straight_sample:
-        cfg.diffusion.straightness.sample.enabled = True
-    if args.straight_sample_gamma is not None:
-        cfg.diffusion.straightness.sample.guidance_gamma = float(args.straight_sample_gamma)
 
     # set some additional parameters
     cfg.restart = False

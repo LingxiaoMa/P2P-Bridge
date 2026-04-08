@@ -16,21 +16,12 @@ diffusion:
   beta_end: 0.02
   t0: 1.e-4
   T: 1.0
-  ot_ode: true
-  straightness:
+  ot_ode: false
+  consistency:
     enabled: false
-    train:
-      use_vm_head: true
-      vm_hidden_dim: 64
-      lambda_vm_mse: 0.05
-      lambda_vm_cos: 0.01
-      lambda_line: 0.00
-      warmup_steps: 40000
-      min_t_ratio: 0.60
-    sample:
-      enabled: false
-      guidance_gamma: 0.00
-      use_vm_direction: true
+    lambda_cons: 0.1
+    warmup_steps: 5000
+    use_ema_target: true
 model:
   type: PVD
   ema: true

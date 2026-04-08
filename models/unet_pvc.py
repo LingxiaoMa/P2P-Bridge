@@ -168,7 +168,7 @@ class PVCNN2Unet(nn.Module):
         assert emb.shape == torch.Size([timesteps.shape[0], self.embed_dim])
         return emb
 
-    def forward(self, x, t, x_cond=None, return_latent: bool = False):
+    def forward(self, x, t, x_cond=None):
         if x_cond is not None:
             x = torch.cat([x, x_cond], dim=1)
 
@@ -260,15 +260,10 @@ class PVCNN2Unet(nn.Module):
             data = fp_blocks(data_fp)
             out_features_list.append(data.features)
 
-        latent_features = data.features
-
         for l in self.classifier:
             if isinstance(l, SharedMLP):
                 data.features = l(data).features
             else:
                 data.features = l(data.features)
-
-        if return_latent:
-            return data.features, latent_features
 
         return data.features

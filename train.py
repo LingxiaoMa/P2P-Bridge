@@ -146,7 +146,7 @@ def train(cfg: DictConfig) -> None:
             loss_accum /= cfg.global_size
             loss_accum = loss_accum.item()
             netpNorm, netgradNorm = getGradNorm(model.model)
-            straight_terms = model.latest_straightness_terms if hasattr(model, "latest_straightness_terms") else {}
+            cons_terms = model.latest_consistency_terms if hasattr(model, "latest_consistency_terms") else {}
 
             logger.info(
                 "[{:>3d}/{:>3d}]\tloss: {:>10.6f},\t" "netpNorm: {:>10.2f},\tnetgradNorm: {:>10.4f}\t",
@@ -164,13 +164,13 @@ def train(cfg: DictConfig) -> None:
                 },
                 step=step,
             )
-            if len(straight_terms) > 0:
+            if len(cons_terms) > 0:
                 logger.info(
-                    "[straightness] {}",
-                    ", ".join([f"{k}: {v:.6f}" for k, v in straight_terms.items()]),
+                    "[consistency] {}",
+                    ", ".join([f"{k}: {v:.6f}" for k, v in cons_terms.items()]),
                 )
                 wandb.log(
-                    {f"straightness/{k}": v for k, v in straight_terms.items()},
+                    {f"consistency/{k}": v for k, v in cons_terms.items()},
                     step=step,
                 )
 
