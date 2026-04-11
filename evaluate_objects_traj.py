@@ -164,8 +164,8 @@ def patch_based_denoise(
 @torch.no_grad()
 def sample(
     cfg: DictConfig,
-    resolutions: List[int] = [10000],
-    noises: List[float] = [0.01],
+    resolutions: List[int] = [10000, 50000],
+    noises: List[float] = [0.01, 0.02, 0.03],
     save_title: str = "P2P-Bridge",
 ) -> None:
     """
