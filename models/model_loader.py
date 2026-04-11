@@ -6,6 +6,7 @@ from loguru import logger
 from torch import optim
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
+from models.dit_pvc import PointDiT
 from models.p2pb import P2PB
 from models.unet_pvc import PVCNN2Unet
 
@@ -71,9 +72,14 @@ def load_model(cfg: Dict) -> torch.nn.Module:
     Returns:
         torch.nn.Module: The loaded model.
     """
-    model = PVCNN2Unet(cfg)
+    model_type = cfg.model.get("type", "PVD")
+    if model_type == "DiT":
+        model = PointDiT(cfg)
+    else:
+        model = PVCNN2Unet(cfg)
     logger.info(
-        f"Generated model with following number of params (M): {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}"
+        f"Backbone: {model_type} | "
+        f"Params (M): {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}"
     )
     return model
 
