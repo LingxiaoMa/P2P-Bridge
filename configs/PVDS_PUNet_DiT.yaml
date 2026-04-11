@@ -35,10 +35,12 @@ model:
   DiT:
     num_tokens: 128
     token_dim: 384
-    num_neighbors: 32
+    num_neighbors: 32          # fallback if coarse/fine not set
+    num_neighbors_coarse: 32   # coarse tokens: large neighbourhood
+    num_neighbors_fine: 8      # fine tokens: small neighbourhood for high-res patches
     num_layers: 6
     num_heads: 6
-    k_interp: 3
+    k_interp: 8                # increased from 3 for better detokenization at 50k
 training:
   optimizer:
     type: AdamW

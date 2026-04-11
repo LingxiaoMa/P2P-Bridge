@@ -137,6 +137,71 @@ class PointTokenizer(nn.Module):
         return token_feats, token_centers
 
 
+# ─── Multi-Scale Tokenizer ───────────────────────────────────────────────────
+
+class MultiScaleTokenizer(nn.Module):
+    """
+    Two-level tokenizer: K/2 coarse tokens (large kNN) + K/2 fine tokens (small kNN).
+
+    Motivation
+    ----------
+    A single PointTokenizer with fixed k=32 works well when patches cover large
+    regions (10k-point clouds, ~20% of shape per patch).  At high resolution
+    (50k, ~4% per patch) the patch is nearly flat: all tokens look similar and
+    self-attention has little to exchange.
+
+    Using two neighbourhood sizes fixes this:
+    - Coarse tokens (k=num_neighbors_coarse): aggregate 32 neighbours → capture
+      the overall surface shape, useful for global reasoning at any resolution.
+    - Fine tokens  (k=num_neighbors_fine):   aggregate  8 neighbours → capture
+      high-frequency geometry; critical at 50k where detail is in tiny areas.
+
+    Both sets attend to each other in every DiT block, so coarse context
+    propagates to fine tokens and vice-versa.
+
+    A learnable type embedding differentiates the two token sets for attention.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        token_dim: int,
+        num_tokens: int,
+        num_neighbors_coarse: int = 32,
+        num_neighbors_fine: int = 8,
+    ):
+        super().__init__()
+        assert num_tokens % 2 == 0, "num_tokens must be even for MultiScaleTokenizer"
+        half = num_tokens // 2
+
+        self.coarse = PointTokenizer(in_dim, token_dim, half, num_neighbors_coarse)
+        self.fine   = PointTokenizer(in_dim, token_dim, half, num_neighbors_fine)
+
+        # Learnable type embeddings: let attention distinguish scale levels
+        self.coarse_type = nn.Parameter(torch.zeros(1, 1, token_dim))
+        self.fine_type   = nn.Parameter(torch.zeros(1, 1, token_dim))
+
+    def forward(self, feats: torch.Tensor, coords: torch.Tensor):
+        """
+        feats:  (B, N, in_dim)
+        coords: (B, N, 3)
+
+        Returns:
+            token_feats:   (B, K, token_dim)   K = num_coarse + num_fine
+            token_centers: (B, K, 3)
+        """
+        coarse_feats, coarse_centers = self.coarse(feats, coords)
+        fine_feats,   fine_centers   = self.fine(feats, coords)
+
+        coarse_feats = coarse_feats + self.coarse_type   # (B, K/2, d)
+        fine_feats   = fine_feats   + self.fine_type     # (B, K/2, d)
+
+        return (
+            torch.cat([coarse_feats, fine_feats], dim=1),     # (B, K, d)
+            torch.cat([coarse_centers, fine_centers], dim=1), # (B, K, 3)
+        )
+
+
 # ─── AdaLN-Zero ──────────────────────────────────────────────────────────────
 
 class AdaLNZero(nn.Module):
@@ -330,6 +395,8 @@ class PointDiT(nn.Module):
         num_tokens = dit_cfg.get("num_tokens", 128)
         token_dim = dit_cfg.get("token_dim", 384)
         num_neighbors = dit_cfg.get("num_neighbors", 32)
+        num_neighbors_coarse = dit_cfg.get("num_neighbors_coarse", num_neighbors)
+        num_neighbors_fine   = dit_cfg.get("num_neighbors_fine", 8)
         num_layers = dit_cfg.get("num_layers", 6)
         num_heads = dit_cfg.get("num_heads", 6)
         k_interp = dit_cfg.get("k_interp", 3)
@@ -351,12 +418,27 @@ class PointDiT(nn.Module):
             nn.Linear(token_dim, token_dim),
         )
 
+        # ── Scale conditioning ────────────────────────────────────────────────
+        # Mean nearest-neighbour distance among input points is a proxy for
+        # patch density: at 50k resolution the patch is spatially smaller but
+        # still contains N=2048 points → after unit-ball normalisation the
+        # points are denser → smaller mean-NN-dist → model can detect resolution.
+        # log is used for numerical stability across a wide range of densities.
+        self.scale_embed = nn.Sequential(
+            nn.Linear(1, token_dim),
+            nn.SiLU(),
+            nn.Linear(token_dim, token_dim),
+        )
+
         # ── Tokenizer ─────────────────────────────────────────────────────────
-        self.tokenizer = PointTokenizer(
+        # MultiScaleTokenizer: K/2 coarse tokens (large kNN) + K/2 fine tokens
+        # (small kNN).  Falls back to uniform k if num_neighbors_fine is not set.
+        self.tokenizer = MultiScaleTokenizer(
             in_dim=feat_dim,
             token_dim=token_dim,
             num_tokens=num_tokens,
-            num_neighbors=num_neighbors,
+            num_neighbors_coarse=num_neighbors_coarse,
+            num_neighbors_fine=num_neighbors_fine,
         )
 
         # ── Positional encoding for token centers (3D xyz → token_dim) ───────
@@ -414,12 +496,19 @@ class PointDiT(nn.Module):
         # ── Positional encoding ───────────────────────────────────────────────
         token_feats = token_feats + self.pos_embed(token_centers)   # (B, K, d)
 
-        # ── Timestep + global conditioning ───────────────────────────────────
-        # Combine timestep and global patch shape into one condition vector.
-        # Every DiT block's adaLN-Zero then sees both "when" and "what shape".
+        # ── Timestep + global + scale conditioning ───────────────────────────
+        # Combine timestep, global patch shape, and density proxy.
         if t.ndim == 2 and t.shape[1] == 1:
             t = t[:, 0]
-        t_emb = self.time_embed(t) + global_feat                    # (B, d)
+
+        # Mean-NN-dist as patch density proxy (resolution signal)
+        # knn_points with K=2: nearest neighbour = index 1 (index 0 = self)
+        with torch.no_grad():
+            nn_dists, _, _ = pytorch3d.ops.knn_points(coords, coords, K=2, return_nn=False)
+            mean_nn_dist = nn_dists[:, :, 1].mean(dim=1, keepdim=True)  # (B, 1)
+        scale_cond = torch.log(mean_nn_dist + 1e-8)                      # (B, 1)
+
+        t_emb = self.time_embed(t) + global_feat + self.scale_embed(scale_cond)  # (B, d)
 
         # ── DiT blocks ────────────────────────────────────────────────────────
         for block in self.blocks:
